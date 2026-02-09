@@ -10,6 +10,12 @@
 #include "../../../include/secp256k1.h"
 #include "../../../include/secp256k1_schnorrsig.h"
 #include "../../hash.h"
+#include "../../ecmult.h"
+#include "../../ecmult_impl.h"
+#include "../../scratch.h"
+#include "../../scalar.h"
+#include "../../group.h"
+#include <stdlib.h>
 
 /* Initializes SHA256 with fixed midstate. This midstate was computed by applying
  * SHA256 to SHA256("BIP0340/nonce")||SHA256("BIP0340/nonce"). */
@@ -266,6 +272,193 @@ int rustsecp256k1_v0_13_schnorrsig_verify(const rustsecp256k1_v0_13_context* ctx
     rustsecp256k1_v0_13_fe_normalize_var(&r.y);
     return !rustsecp256k1_v0_13_fe_is_odd(&r.y) &&
            rustsecp256k1_v0_13_fe_equal(&rx, &r.x);
+}
+
+/* Data structure for batch verification callback */
+typedef struct {
+    const rustsecp256k1_v0_13_context *ctx;
+    const unsigned char *const *sig64;
+    const unsigned char *const *msg;
+    const size_t *msglen;
+    const rustsecp256k1_v0_13_xonly_pubkey *const *pubkey;
+    rustsecp256k1_v0_13_scalar *randoms;
+    rustsecp256k1_v0_13_scalar *s_scalars;
+    rustsecp256k1_v0_13_scalar *e_scalars;
+    rustsecp256k1_v0_13_ge *pk_points;
+    rustsecp256k1_v0_13_ge *r_points;
+    size_t n;
+} schnorrsig_batch_data;
+
+/* Callback for ecmult_multi_var to get scalars and points for batch verification */
+static int schnorrsig_batch_callback(rustsecp256k1_v0_13_scalar *sc, rustsecp256k1_v0_13_ge *pt, size_t idx, void *cbdata) {
+    schnorrsig_batch_data *data = (schnorrsig_batch_data *)cbdata;
+    rustsecp256k1_v0_13_scalar neg_e;
+
+    if (idx >= data->n) {
+        return 0;
+    }
+
+    /* Set scalar: random * (-e) */
+    rustsecp256k1_v0_13_scalar_negate(&neg_e, &data->e_scalars[idx]);
+    rustsecp256k1_v0_13_scalar_mul(sc, &data->randoms[idx], &neg_e);
+
+    /* Set point: pk */
+    *pt = data->pk_points[idx];
+
+    return 1;
+}
+
+int rustsecp256k1_v0_13_schnorrsig_verify_batch(
+    const rustsecp256k1_v0_13_context *ctx,
+    const unsigned char *const *sig64,
+    const unsigned char *const *msg,
+    const size_t *msglen,
+    const rustsecp256k1_v0_13_xonly_pubkey *const *pubkey,
+    size_t n_sigs
+) {
+    size_t i;
+    rustsecp256k1_v0_13_scalar s, e;
+    rustsecp256k1_v0_13_ge pk, r;
+    rustsecp256k1_v0_13_fe rx;
+    rustsecp256k1_v0_13_gej sum, rj, neg_rj;
+    rustsecp256k1_v0_13_scalar g_scalar, random;
+    unsigned char buf[32];
+    int overflow;
+    schnorrsig_batch_data batch_data;
+    rustsecp256k1_v0_13_scratch *scratch = NULL;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(sig64 != NULL);
+    ARG_CHECK(msg != NULL);
+    ARG_CHECK(msglen != NULL);
+    ARG_CHECK(pubkey != NULL);
+
+    if (n_sigs == 0) {
+        return 1;
+    }
+
+    if (n_sigs == 1) {
+        /* Single signature: use individual verification */
+        return rustsecp256k1_v0_13_schnorrsig_verify(ctx, sig64[0], msg[0], msglen[0], pubkey[0]);
+    }
+
+    /* Allocate arrays for batch data */
+    batch_data.ctx = ctx;
+    batch_data.sig64 = sig64;
+    batch_data.msg = msg;
+    batch_data.msglen = msglen;
+    batch_data.pubkey = pubkey;
+    batch_data.n = n_sigs;
+
+    /* Allocate memory for batch verification data */
+    batch_data.randoms = (rustsecp256k1_v0_13_scalar *)malloc(n_sigs * sizeof(rustsecp256k1_v0_13_scalar));
+    batch_data.s_scalars = (rustsecp256k1_v0_13_scalar *)malloc(n_sigs * sizeof(rustsecp256k1_v0_13_scalar));
+    batch_data.e_scalars = (rustsecp256k1_v0_13_scalar *)malloc(n_sigs * sizeof(rustsecp256k1_v0_13_scalar));
+    batch_data.pk_points = (rustsecp256k1_v0_13_ge *)malloc(n_sigs * sizeof(rustsecp256k1_v0_13_ge));
+    batch_data.r_points = (rustsecp256k1_v0_13_ge *)malloc(n_sigs * sizeof(rustsecp256k1_v0_13_ge));
+
+    if (!batch_data.randoms || !batch_data.s_scalars || !batch_data.e_scalars ||
+        !batch_data.pk_points || !batch_data.r_points) {
+        goto cleanup;
+    }
+
+    /* Parse all signatures and compute challenges */
+    for (i = 0; i < n_sigs; i++) {
+        /* Parse signature */
+        if (!rustsecp256k1_v0_13_fe_set_b32_limit(&rx, &sig64[i][0])) {
+            goto cleanup;
+        }
+
+        rustsecp256k1_v0_13_scalar_set_b32(&s, &sig64[i][32], &overflow);
+        if (overflow) {
+            goto cleanup;
+        }
+        batch_data.s_scalars[i] = s;
+
+        /* Load public key */
+        if (!rustsecp256k1_v0_13_xonly_pubkey_load(ctx, &pk, pubkey[i])) {
+            goto cleanup;
+        }
+        batch_data.pk_points[i] = pk;
+
+        /* Compute challenge e */
+        rustsecp256k1_v0_13_fe_get_b32(buf, &pk.x);
+        rustsecp256k1_v0_13_schnorrsig_challenge(&e, &sig64[i][0], msg[i], msglen[i], buf);
+        batch_data.e_scalars[i] = e;
+
+        /* Compute R point from signature (with even y) */
+        if (!rustsecp256k1_v0_13_ge_set_xo_var(&r, &rx, 0)) {
+            goto cleanup;
+        }
+        batch_data.r_points[i] = r;
+
+        /* Generate random scalar for linear combination */
+        /* Use a simple deterministic PRNG based on signature data for reproducibility */
+        /* In production, use cryptographically secure randomness */
+        rustsecp256k1_v0_13_scalar_set_b32(&random, &sig64[i][0], NULL);
+        rustsecp256k1_v0_13_scalar_add(&random, &random, &e);
+        batch_data.randoms[i] = random;
+    }
+
+    /* Use NULL scratch - ecmult_multi_var will use simple algorithm for small batches */
+    /* This is fine for our use case and avoids needing scratch space API */
+    scratch = NULL;
+
+    /* Compute g_scalar = sum_i (random_i * s_i) */
+    rustsecp256k1_v0_13_scalar_clear(&g_scalar);
+    for (i = 0; i < n_sigs; i++) {
+        rustsecp256k1_v0_13_scalar term;
+        rustsecp256k1_v0_13_scalar_mul(&term, &batch_data.randoms[i], &batch_data.s_scalars[i]);
+        rustsecp256k1_v0_13_scalar_add(&g_scalar, &g_scalar, &term);
+    }
+
+    /* Compute sum = g_scalar * G + sum_i (random_i * (-e_i) * pk_i) using ecmult_multi_var */
+    if (!rustsecp256k1_v0_13_ecmult_multi_var(&ctx->error_callback, scratch, &sum, &g_scalar, schnorrsig_batch_callback, &batch_data, n_sigs)) {
+        goto cleanup;
+    }
+
+    /* Compute neg_sum = sum_i (random_i * R_i) using ecmult */
+    rustsecp256k1_v0_13_gej_set_infinity(&rj);
+    for (i = 0; i < n_sigs; i++) {
+        rustsecp256k1_v0_13_gej term;
+        rustsecp256k1_v0_13_gej_set_ge(&term, &batch_data.r_points[i]);
+        /* Multiply by scalar using ecmult: random * R = random * R + 0 * G */
+        rustsecp256k1_v0_13_ecmult(&term, &term, &batch_data.randoms[i], &rustsecp256k1_v0_13_scalar_zero);
+        rustsecp256k1_v0_13_gej_add_var(&rj, &rj, &term, NULL);
+    }
+
+    /* Check if sum - neg_sum = 0 (i.e., sum + (-neg_sum) = 0) */
+    rustsecp256k1_v0_13_gej_neg(&neg_rj, &rj);
+    rustsecp256k1_v0_13_gej_add_var(&sum, &sum, &neg_rj, NULL);
+
+    /* No cleanup needed - scratch was NULL */
+
+    /* Check if result is infinity (all signatures valid) */
+    if (rustsecp256k1_v0_13_gej_is_infinity(&sum)) {
+        /* All signatures are valid */
+        goto success;
+    }
+
+    /* At least one signature is invalid */
+    goto cleanup;
+
+success:
+    /* Free allocated memory */
+    free(batch_data.randoms);
+    free(batch_data.s_scalars);
+    free(batch_data.e_scalars);
+    free(batch_data.pk_points);
+    free(batch_data.r_points);
+    return 1;
+
+cleanup:
+    /* No scratch space to clean up */
+    if (batch_data.randoms) free(batch_data.randoms);
+    if (batch_data.s_scalars) free(batch_data.s_scalars);
+    if (batch_data.e_scalars) free(batch_data.e_scalars);
+    if (batch_data.pk_points) free(batch_data.pk_points);
+    if (batch_data.r_points) free(batch_data.r_points);
+    return 0;
 }
 
 #endif

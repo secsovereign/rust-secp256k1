@@ -183,6 +183,30 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_13_schnorrsig_ve
     const rustsecp256k1_v0_13_xonly_pubkey *pubkey
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(5);
 
+/** Verify multiple Schnorr signatures in batch using multi-scalar multiplication.
+ *
+ *  This function verifies multiple Schnorr signatures more efficiently than
+ *  calling rustsecp256k1_v0_13_schnorrsig_verify multiple times by sharing expensive
+ *  elliptic curve operations across all signatures.
+ *
+ *  Returns: 1: all signatures are valid
+ *           0: at least one signature is invalid (or other error)
+ *  Args:    ctx: pointer to a context object
+ *  In:    sig64: array of pointers to 64-byte signatures
+ *           msg: array of pointers to messages (can be NULL if msglen[i] is 0)
+ *       msglen: array of message lengths
+ *       pubkey: array of pointers to x-only public keys
+ *       n_sigs: number of signatures to verify
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_13_schnorrsig_verify_batch(
+    const rustsecp256k1_v0_13_context *ctx,
+    const unsigned char *const *sig64,
+    const unsigned char *const *msg,
+    const size_t *msglen,
+    const rustsecp256k1_v0_13_xonly_pubkey *const *pubkey,
+    size_t n_sigs
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
+
 #ifdef __cplusplus
 }
 #endif
